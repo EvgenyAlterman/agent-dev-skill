@@ -419,8 +419,9 @@ DELAY=$([ "$WORKERS_ALIVE" -gt 0 ] && echo "$WORKER_INTERVAL" || echo "$IDLE_INT
 # ScheduleWakeup delaySeconds=$DELAY
 ```
 
-End the turn with a brief status: workers spawned, outcomes reflected, what's in
-flight, or "no candidates." Show the next poll time in **Israel time (IDT/IST)**.
+**Reporting rule — be terse:**
+- Nothing happened this tick → output exactly: `Cycle N — no changes.`
+- Something happened → one line per event only (worker spawned, PR opened, comment picked up, PR merged, error). No bullet lists, no restating what's open, no next-poll countdown.
 
 Keep idle ticks minimal — one board query, spawn/skip/outcome logic, done.
 
