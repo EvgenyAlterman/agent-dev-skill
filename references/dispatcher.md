@@ -138,11 +138,8 @@ feels large (cycle > 50 and queries are getting truncated).
 **When triggered:**
 1. Finish the tick normally.
 2. Call `ScheduleWakeup` as usual.
-3. **Invoke the `/compact` skill directly** as the very last action:
-   ```
-   Skill({ skill: "compact" })
-   ```
-   The next wakeup fires into a fresh context and proceeds with full re-hydration.
+3. Tell the user: "**[Auto-Dev] Compaction cycle N reached — please run `/compact` then `start auto-dev polling each 5 minutes` to keep context lean.**"
+   The wakeup continues regardless; compaction is advisory but recommended.
 
 **On the first tick after a compaction** (or fresh session start), always
 re-read the full board state before doing anything else:
