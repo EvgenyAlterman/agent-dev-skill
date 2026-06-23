@@ -114,6 +114,58 @@ This skill runs in one of two modes. Decide which from how you were invoked:
 
 # Dispatcher mode
 
+## Notifications — Slack only, changes only
+
+**Channel:** `#alterman-auto-dev` (channel ID resolved at runtime via `mcp-s-cli call slack__find-channel-id '{"channelName":"alterman-auto-dev"}'`).
+
+**Rule:** send a Slack message for every meaningful state change. **Never notify on empty cycles** (no DEV/TESTING/CANDIDATE rows, nothing happened). Silence is correct for idle ticks.
+
+**Notify on:**
+| Event | Message format |
+|-------|---------------|
+| Worker spawned | `🚀 *<task name>* — worker spawned (\`<sessionId>\`) on branch \`<branch>\`` |
+| PR opened | `✅ *<task name>* — PR opened: <pr_url>\n<summary>` |
+| Worker blocked | `🔶 *<task name>* — worker blocked: <question>` |
+| Worker failed | `❌ *<task name>* — worker failed: <reason>` |
+| Worker stuck / re-triggered | `⚠️ *<task name>* — worker \`<sessionId>\` was stuck (<reason>), re-triggered` |
+| Review feedback picked up | `🔄 *<task name>* — picked up review feedback, spawning worker on existing PR` |
+| Task canceled (worker in flight) | `🚫 *<task name>* — task canceled while worker running; killed worker, closed PR` |
+| PR merged → Done | `🎉 *<task name>* — PR merged, task Done` |
+| PR closed → Canceled | `🚫 *<task name>* — PR closed without merging, task Canceled` |
+
+**How to send:**
+```bash
+CHANNEL_ID=$(mcp-s-cli call slack__find-channel-id '{"channelName":"alterman-auto-dev"}' | jq -r '.channelId')
+mcp-s-cli call slack__post_message "{\"channel\":\"$CHANNEL_ID\",\"text\":\"MESSAGE HERE\"}"
+```
+
+Cache `CHANNEL_ID` for the session — don't re-resolve it every tick.
+
+**Monday comments policy:** Monday is for **task business data only** — status changes and the PR link column. Remove chatty `[Auto-Dev]` narrative comments (worker spawned, picking up feedback, re-triggered, etc.) that were previously posted as Monday updates. The only Monday comment that remains is the **blocked question** (because that's where the assignee will respond) and the **PR-opened link** (set via column value, not a comment). All narrative goes to Slack.
+
+## Meta — Self-improving skill (dispatcher only)
+
+The dispatcher session is the **live source of truth** for this skill. Whenever
+the user corrects a behavior, points out a missed case, or requests a change to
+how the loop works, **immediately update this skill file** to encode the fix —
+don't just apply it to the current session and forget it.
+
+**When to update:** any time the user says something like "you should have…",
+"next time…", "add this to the skill", "remember to…", or when you notice a gap
+in the skill that caused a real problem this session.
+
+**How to update:**
+1. Edit `~/.claude/skills/auto-agent-dev/SKILL.md` directly (Edit tool) in the
+   same turn you apply the behavior change.
+2. Place the new rule in the most relevant existing section, or add a new section
+   if it doesn't fit anywhere.
+3. Write the rule in imperative, durable form — not "the user said X today" but
+   "always do X when Y".
+4. Briefly tell the user: "Updated skill: <one-line description of the change>."
+
+This means the skill improves continuously across sessions without the user
+needing to re-explain the same correction.
+
 ## Step 1 — Preflight & poll interval
 
 ### Poll interval (first invocation only)
@@ -229,6 +281,9 @@ zero result from a filtered query can be a silent filter failure (see note below
    handle merged/closed (see "Housekeeping — PR lifecycle tracking" section below).
 3. **Follow-up instructions** — check suspended sessions for new thread messages
    (see "Housekeeping — follow-up instructions" section below).
+4. **Worker health check** — for every in-flight worker (tracked in cp-sessions.json,
+   no outcome file yet), capture its tmux pane and check for stuck/crashed state;
+   re-trigger and alert the user if needed (see "Housekeeping — worker health check" below).
 
 **Query reliability note — always use the full board query for housekeeping:**
 
@@ -492,6 +547,10 @@ CP_SESSIONS="$HOME/.auto-agent/cp-sessions.json"
 jq --arg task "$ID" --arg sess "$SESSION_ID" --arg wt "$WORKTREE" --arg repo "$REPO_NAME" \
   '.[$task] = {"sessionId": $sess, "worktree": $wt, "repo": $repo}' \
   "$CP_SESSIONS" > /tmp/cp-sessions-tmp.json && mv /tmp/cp-sessions-tmp.json "$CP_SESSIONS"
+
+# 6. Notify Slack (no Monday comment — Slack is the narrative channel)
+CHANNEL_ID=$(mcp-s-cli call slack__find-channel-id '{"channelName":"alterman-auto-dev"}' | jq -r '.channelId')
+mcp-s-cli call slack__post_message "{\"channel\":\"$CHANNEL_ID\",\"text\":\"🚀 *$TASK_NAME* — worker spawned (\`$SESSION_ID\`) on branch \`$BRANCH\`\"}"
 ```
 
 > **Critical:** `initialPrompt` MUST be in the POST body — passing it as a WebSocket URL
@@ -567,30 +626,29 @@ DAEMON="${CODERPLEX_DAEMON_URL:-http://127.0.0.1:3285}"
 
 - **Entry in cp-sessions.json, no outcome file** → worker still running. Leave it.
 - **Outcome file present** → read `<worktree>/.auto-agent-outcome.json`:
-  - `pr_opened` → set status **Ready For Testing**, set the PR-link column, and
-    post an **`[Auto-Dev]`** comment with the PR link + the worker's `summary`.
-    Record the ID of that comment as `lastProcessedUpdateId`.
-    **Suspend the session** — kill the tmux process to free resources, but keep the
-    worktree and coderplex session record for potential review-comment work:
+  - `pr_opened` → set status **Ready For Testing**, set the PR-link column (via
+    column value mutation — no comment needed). **Suspend the session** — kill the
+    tmux process to free resources, but keep the worktree and coderplex session
+    record for potential review-comment work:
     ```bash
     tmux kill-session -t "coderplex-<sessionId>-claude" 2>/dev/null || true
     ```
     Update cp-sessions.json to include `prUrl` and `lastProcessedUpdateId`:
     ```bash
-    jq --arg task "$ID" --arg prUrl "$PR_URL" --arg updateId "$UPDATE_ID" \
-      '.[$task].prUrl = $prUrl | .[$task].lastProcessedUpdateId = $updateId | .[$task].suspended = true' \
+    jq --arg task "$ID" --arg prUrl "$PR_URL" \
+      '.[$task].prUrl = $prUrl | .[$task].suspended = true' \
       "$CP_SESSIONS" > /tmp/cp-tmp.json && mv /tmp/cp-tmp.json "$CP_SESSIONS"
     ```
+    **Notify Slack:** `✅ *<task name>* — PR opened: <pr_url>\n<summary>`
     Full cleanup happens when the PR merges or closes (PR lifecycle step below).
-  - `blocked` → set status **Blocked** and post an **`[Auto-Dev]`** comment with
-    the worker's `question` (specific + options + recommended default). Then clean
-    up: `curl -s -X DELETE "$DAEMON/api/sessions/<sessionId>"` and remove the entry
-    from cp-sessions.json. (The dispatcher re-picks the task if/when it returns to
-    Ready For Dev.)
-  - `failed` → leave the task in `Dev`, post an **`[Auto-Dev]`** comment noting
-    the failure `reason`, and flag it to the user. **Do not delete the session** —
-    leave it alive so the user can attach and inspect. Keep the entry in
-    cp-sessions.json.
+  - `blocked` → set status **Blocked** and post an **`[Auto-Dev]`** comment on
+    the Monday task with the worker's `question` (this is the one Monday comment
+    that stays — the assignee will respond there). Then clean up:
+    `curl -s -X DELETE "$DAEMON/api/sessions/<sessionId>"` and remove the entry
+    from cp-sessions.json. **Notify Slack:** `🔶 *<task name>* — worker blocked: <question>`
+  - `failed` → leave the task in `Dev`, flag to the user. **Do not delete the session** —
+    leave it alive so the user can attach and inspect. Keep the entry in cp-sessions.json.
+    **Notify Slack:** `❌ *<task name>* — worker failed: <reason>`
 - **No entry in cp-sessions.json for a Dev task** → the task was claimed but no
   session was created (e.g. pre-coderplex session, or the dispatcher crashed
   between claim and spawn). Flag to the user; do not re-spawn blindly.
@@ -604,10 +662,15 @@ For every **suspended** session in `cp-sessions.json` (those with `"suspended": 
 fetch the task's Monday update thread and look for new follow-up instructions from
 the assignee.
 
-**The rule:** messages in the thread from the assignee (Evgeny Alterman) that do
-**not** start with `[Auto-Dev]` are treated as instructions to the worker. Since
-the dispatcher posts as Evgeny's account, `[Auto-Dev]`-prefixed messages are from
-the dispatcher; unprefixed messages are from the human.
+**The rule:** any message in the thread that does **not** start with `[Auto-Dev]`
+and was posted **after** `lastProcessedUpdateId` is treated as a follow-up
+instruction — regardless of who posted it. This includes the assignee, reviewers,
+product managers, or anyone else. `[Auto-Dev]`-prefixed messages are from the
+dispatcher and are skipped.
+
+**Important:** reviewer feedback posted in the Monday thread (not on GitHub) is
+follow-up instructions. Do not limit detection to the assignee only — that caused
+a real miss where Maya Wineman's review comments went unactioned for several ticks.
 
 ```bash
 # Fetch updates for a task
@@ -620,10 +683,9 @@ mcp-s-cli call monday__all_monday_api \
 2. Find the update whose `id == lastProcessedUpdateId` — that's the last one the
    dispatcher handled.
 3. Look at all updates **after** that position.
-4. Filter for updates where `creator.name` contains "Evgeny" (or the configured
-   assignee) AND `body` does **not** start with `[Auto-Dev]`.
-5. If any such updates exist, they are follow-up instructions. Concatenate them in
-   order as the instruction text.
+4. Filter out updates where `body` starts with `[Auto-Dev]` (those are from the dispatcher).
+5. Any remaining updates are follow-up instructions. Concatenate them in order,
+   noting the author of each so the worker has context.
 
 **When a follow-up is found:**
 
@@ -642,8 +704,8 @@ mcp-s-cli call monday__all_monday_api \
    ```
    Mark `"suspended": false` in cp-sessions.json.
 
-2. **Acknowledge in Monday** — post an `[Auto-Dev]` comment:
-   `[Auto-Dev] Picked up follow-up instructions — worker resuming on PR #<N>.`
+2. **Notify Slack:** `🔄 *<task name>* — picked up review/follow-up feedback, worker resuming on PR #<N>`
+   (No Monday comment — keep Monday clean.)
 
 3. **Update `lastProcessedUpdateId`** to the ID of the last follow-up update you
    processed.
@@ -683,19 +745,19 @@ gh pr view "$PR_NUM" --repo "$REPO_SLUG" --json state,mergedAt,headRefName
 - `state == "OPEN"` → leave it. Nothing to do this tick.
 - `state == "MERGED"` →
   1. Set the task status to **Done** (the "merged" status).
-  2. Post an **`[Auto-Dev]`** comment: `[Auto-Dev] PR #<N> merged — task complete.`
-  3. Delete the remote branch: `git push origin --delete "<headRefName>"` (get
+  2. Delete the remote branch: `git push origin --delete "<headRefName>"` (get
      `headRefName` from the `gh pr view` output). Swallow errors if already deleted.
-  4. **Delete the coderplex session**: look up the task's entry in `cp-sessions.json`,
+  3. **Delete the coderplex session**: look up the task's entry in `cp-sessions.json`,
      call `curl -s -X DELETE "$DAEMON/api/sessions/<sessionId>"`, and remove the entry.
+  4. **Notify Slack:** `🎉 *<task name>* — PR merged, task Done`
 - `state == "CLOSED"` (not merged) →
   1. Look up the board's status labels at runtime. If a **Canceled** label exists,
      set the task to that status. If not, leave the status unchanged and flag to
      the user — do **not** map it to an arbitrary label.
-  2. Post an **`[Auto-Dev]`** comment: `[Auto-Dev] PR #<N> closed without merging — marked Canceled (or see flag above).`
-  3. Delete the remote branch the same way as for merged.
-  4. **Delete the coderplex session**: same as merged — look up cp-sessions.json,
+  2. Delete the remote branch the same way as for merged.
+  3. **Delete the coderplex session**: same as merged — look up cp-sessions.json,
      DELETE via daemon API, remove the entry.
+  4. **Notify Slack:** `🚫 *<task name>* — PR closed without merging, task Canceled`
 
 **Scope:** only act on tasks whose PR link was set by this loop (i.e. the task was
 in `Ready For Testing` with a non-null `link_mm4bmp5j`). Do not touch tasks that
@@ -703,6 +765,70 @@ reached `Ready For Testing` by other means — if the PR link column is empty, s
 the item entirely. The `TESTING` rows from the Step 1c full-board query already
 carry exactly these fields (each `TESTING` row only exists when the PR link is
 non-empty); consume those rows rather than issuing another board query here.
+
+**Manual Canceled while worker in flight:** If the board shows a task as `Canceled`
+but it still has an active entry in `cp-sessions.json` (worker running), treat it
+like a closed PR — kill the worker tmux session, close the open PR (with a brief
+closing comment on GitHub only), delete the remote branch, delete the coderplex
+session, and remove from cp-sessions.json. Don't wait for a PR-close event; act
+on it this tick. **Notify Slack:** `🚫 *<task name>* — task canceled while worker running; killed worker, closed PR`
+
+## Housekeeping — worker health check (each tick)
+
+For every in-flight worker (entry in `cp-sessions.json` with no outcome file yet),
+capture its tmux pane and check whether it is stuck or crashed. Run this **after**
+reflecting outcomes (so a just-finished worker isn't falsely flagged) and **before**
+picking new candidates.
+
+```bash
+CP_SESSIONS="$HOME/.auto-agent/cp-sessions.json"
+jq -r 'to_entries[] | select(.value.suspended != true) | "\(.key) \(.value.sessionId) \(.value.worktree)"' \
+  "$CP_SESSIONS" 2>/dev/null | while read TASK_ID SESSION_ID WT; do
+  # Skip if outcome file already written
+  [ -f "$WT/.auto-agent-outcome.json" ] && continue
+
+  TMUX_NAME="coderplex-$SESSION_ID-claude"
+  PANE=$(tmux capture-pane -t "$TMUX_NAME" -p -S -20 2>/dev/null)
+
+  # Stuck signals: API error line OR idle prompt (❯) with no active spinner
+  API_ERROR=$(echo "$PANE" | grep -c "API Error:" || true)
+  # Active spinner lines contain "✻" or "●" or "⎿" — if none present and prompt visible, worker is idle
+  HAS_SPINNER=$(echo "$PANE" | grep -cE "✻|●|⎿" || true)
+  HAS_PROMPT=$(echo "$PANE" | grep -c "^❯" || true)
+  IDLE=$( [ "$HAS_PROMPT" -gt 0 ] && [ "$HAS_SPINNER" -eq 0 ] && echo 1 || echo 0 )
+
+  if [ "$API_ERROR" -gt 0 ] || [ "$IDLE" -eq 1 ]; then
+    REASON="idle/crashed"
+    [ "$API_ERROR" -gt 0 ] && REASON="API Error (529 or similar)"
+    echo "STUCK|$TASK_ID|$SESSION_ID|$REASON"
+  fi
+done
+```
+
+**When a worker is detected stuck:**
+
+1. **Re-trigger** via `tmux send-keys`:
+   ```bash
+   tmux send-keys -t "coderplex-$SESSION_ID-claude" \
+     "Read .auto-agent-task.md and continue from where you left off. Implement the task, push, and write .auto-agent-outcome.json when done." \
+     Enter
+   ```
+2. **Notify Slack:** `⚠️ *<task name>* — worker \`<sessionId>\` was stuck (<reason>), re-triggered`
+3. **Do not re-trigger more than once per tick per session** — if it was already
+   re-triggered last tick (track via a `retriggeredAt` timestamp in cp-sessions.json)
+   and is still stuck, notify Slack and leave it for manual inspection instead
+   of looping endlessly: `⚠️ *<task name>* — worker \`<sessionId>\` still stuck after re-trigger, needs manual inspection`
+
+```bash
+# Record re-trigger time to avoid looping
+jq --arg task "$TASK_ID" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '.[$task].retriggeredAt = $ts' "$CP_SESSIONS" > /tmp/cp-tmp.json && mv /tmp/cp-tmp.json "$CP_SESSIONS"
+```
+
+**If the tmux session doesn't exist at all** (pane capture returns an error), the
+worker process died entirely. Alert the user — do not silently leave the task in
+`Dev` forever:
+> ⚠️ Worker `<sessionId>` tmux session gone — the worker process died. Manual inspection needed.
 
 ---
 
