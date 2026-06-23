@@ -73,7 +73,7 @@ assignee, or status label, use theirs.
 | Poll interval (idle)  | 5 minutes (`300s`) — used when no workers are in flight                                                                                                           |
 | Poll interval (active)| 90 seconds — workers may also signal instantly via tmux (see W6b)                                                                                                |
 | Dispatcher state      | `~/.auto-agent/dispatcher-state.json` — persists cycle counter, `pollIntervalSeconds`, `workerPollIntervalSeconds`                                               |
-| Slack channel         | `#alterman-auto-dev` — notifications only; resolve channel ID at runtime via `mcp-s-cli`                                                                         |
+| Slack channel         | `#alterman-auto-dev` — channel ID hardcoded as `C0BCE486ENS` in dispatcher.md                                                                                   |
 
 Status **labels vary per board** — read the board's status column options at
 runtime and match by intent rather than assuming these exact strings. If you
