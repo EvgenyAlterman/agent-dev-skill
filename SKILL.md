@@ -1,5 +1,6 @@
 ---
 name: auto-agent-dev
+model: sonnet
 description: >-
   Autonomous "pick a ticket and ship it" dev loop driven by a monday.com board.
   A lightweight dispatcher (the only party authenticated to monday) polls the
@@ -67,7 +68,7 @@ assignee, or status label, use theirs.
 | `wixel-agent` repo   | `~/dev/wixel-agent` — all agent runtime, service, admin, chat-ui, simulator work |
 | `wixel-ai-tools` repo | `~/dev/wixel-ai-tools` — fal.ai integration, SDK mapping, mapping admin, mapping service |
 | Coderplex daemon     | `http://127.0.0.1:3285` (or `$CODERPLEX_DAEMON_URL`) |
-| Session tracking     | `~/.auto-agent/cp-sessions.json` — maps `taskId → {sessionId, worktree, repo}` |
+| Session tracking     | `~/.auto-agent/cp-sessions.json` — maps `taskId → {sessionId, worktree, repo}`; entries grow `prUrl`, `lastProcessedUpdateId`, `suspended` once a worker opens a PR |
 | Task-spec file       | `<worktree>/.auto-agent-task.md` (dispatcher → worker) |
 | Outcome file         | `<worktree>/.auto-agent-outcome.json` (worker → dispatcher) |
 | Poll interval (idle) | 10 minutes (`600s`) — default; used when no workers are in flight |
@@ -172,8 +173,11 @@ Workers need an authenticated `gh` to open PRs non-interactively.
 
 ## Step 1b — Cycle counter & compaction
 
-Read `~/.auto-agent/dispatcher-state.json` (create it with `{"cycle":0}` if missing).
-Increment `cycle` by 1 and write it back. Then check two compaction triggers:
+Read `~/.auto-agent/dispatcher-state.json` (if missing, seed it with `cycle` plus
+the two interval fields — see the code block below). Increment `cycle` by 1 and
+write it back **with `jq` so the interval fields are preserved** (a naive
+`echo '{"cycle":N}'` overwrite drops `pollIntervalSeconds`/`workerPollIntervalSeconds`).
+Then check two compaction triggers:
 
 - **Every 10 cycles** (`cycle % 10 === 0`)
 - **Token pressure** — treat this as triggered if the cycle counter is high (>50) AND
@@ -232,30 +236,41 @@ Server-side status filters (`compare_value`) can silently return 0 even when
 matching items exist (observed in practice). For housekeeping, always fetch the
 full `items_page` without a filter and do the filtering client-side:
 
+This **one query is the single source of truth for the whole tick** — its parsed
+rows feed all three housekeeping checks *and* candidate selection in Step 2. Run
+it once; do not issue separate per-status queries anywhere else in the tick.
+
 ```bash
-# Full board query — reliable, use for all housekeeping checks
+# Full board query — the only board read per tick. Emits TESTING / DEV / CANDIDATE rows.
+ASSIGNEE="Evgeny"   # configured assignee (substring match); override if the user named someone else
 mcp-s-cli call monday__all_monday_api '{
-  "query": "{ boards(ids: [18417884038]) { items_page(limit: 100) { items { id name column_values(ids: [\"color_mm4bfq4e\",\"multiple_person_mm4bmdmw\",\"link_mm4bmp5j\"]) { id text } } } } }"
-}' | python3 -c "
-import sys, json
-items = json.load(sys.stdin)[\"data\"][\"boards\"][0][\"items_page\"][\"items\"]
+  "query": "{ boards(ids: [18417884038]) { items_page(limit: 100) { items { id name column_values(ids: [\"color_mm4bfq4e\",\"multiple_person_mm4bmdmw\",\"link_mm4bmp5j\",\"color_mm4bq911\"]) { id text } } } } }"
+}' | ASSIGNEE="$ASSIGNEE" python3 -c "
+import sys, json, os
+assignee = os.environ.get('ASSIGNEE', 'Evgeny')
+items = json.load(sys.stdin)['data']['boards'][0]['items_page']['items']
 for item in items:
-    cols = {c[\"id\"]: c[\"text\"] for c in item[\"column_values\"]}
-    status = cols.get(\"color_mm4bfq4e\", \"\")
-    owners = cols.get(\"multiple_person_mm4bmdmw\", \"\")
-    pr = cols.get(\"link_mm4bmp5j\", \"\")
-    # Filter client-side:
-    # Ready For Testing items with a PR link → PR lifecycle check
-    if status == \"Ready For Testing\" and pr:
+    cols = {c['id']: c['text'] for c in item['column_values']}
+    status = cols.get('color_mm4bfq4e', '')
+    owners = cols.get('multiple_person_mm4bmdmw', '') or ''
+    pr = cols.get('link_mm4bmp5j', '')
+    priority = cols.get('color_mm4bq911', '')
+    mine = assignee in owners
+    # Ready For Testing + PR link → PR lifecycle check
+    if status == 'Ready For Testing' and pr:
         print(f'TESTING|{item[\"id\"]}|{item[\"name\"]}|{pr}')
-    # Dev items → reflect worker outcomes
-    elif status == \"Dev\" and \"Evgeny\" in owners:
+    # Dev → reflect worker outcomes
+    elif status == 'Dev' and mine:
         print(f'DEV|{item[\"id\"]}|{item[\"name\"]}')
+    # Ready For Dev + assigned to me → candidate for Step 2
+    elif status == 'Ready For Dev' and mine:
+        print(f'CANDIDATE|{item[\"id\"]}|{item[\"name\"]}|priority={priority}')
 "
 ```
 
-Run this once per tick and pipe the output into both the reflect-outcomes check
-and the PR lifecycle check — one round-trip to monday, two checks covered.
+Capture this output once per tick and reuse it: `TESTING` rows drive PR lifecycle,
+`DEV` rows drive worker-outcome reflection, `CANDIDATE` rows are the Step 2 picks.
+One round-trip to monday covers everything; no other board query is needed this tick.
 
 ## Step 2 — Find candidate tasks (strict gate)
 
@@ -271,32 +286,24 @@ Do not rationalize past the assignee gate. If you catch yourself thinking "this
 one isn't assigned to them but is clearly intended," **stop** — that is exactly
 the case this guard prevents. Report zero candidates instead.
 
-Query mechanics (keep it token-cheap):
+Query mechanics (single source of truth):
 
-- Filter server-side where possible; request **only** `id`, `name`, the priority
-  column, the status column, and the owner column. Pipe through `jq` to trim the
-  payload before it reaches context.
-- If a filter returns nothing unexpectedly, **probe one item** in full to learn
-  the real column IDs/value shapes, then re-run. Never dump the unfiltered board.
+- **Candidates are the `CANDIDATE` rows from the Step 1c full-board query** — do
+  **not** run a separate server-side filtered query for Ready For Dev. The
+  `compare_value` filter can silently return 0 even when matching items exist
+  (the same bug that hid Ready For Testing items in practice). On the candidate
+  path that failure is invisible: it would drop a real task and make the loop
+  report "no candidates" when one exists. Reuse Step 1c's output instead.
+- Step 1c already requests `id`, `name`, status, owner, and priority by column ID
+  — everything candidate selection needs, in one round-trip.
 
 **IMPORTANT — always use column ID lookups, never positional index:**
 
 The `column_values` array order is board-defined and not guaranteed. Using
-`column_values[0]` or `column_values[1]` will silently read the wrong column and
-cause tasks to be missed. Always select by column ID:
-
-```bash
-# CORRECT — look up by column ID
-mcp-s-cli call monday__all_monday_api '...' | jq -r '
-  .data.boards[0].items_page.items[] |
-  (.column_values | (map(select(.id=="color_mm4bfq4e"))[0].text) as $status |
-   map(select(.id=="multiple_person_mm4bmdmw"))[0].text as $owner |
-   select($status=="Ready For Dev" and ($owner | test("Evgeny")))) |
-  "\(.id) | \(.name)"'
-
-# WRONG — positional index silently reads wrong column
-# .column_values[0].text  ← DO NOT USE
-```
+`column_values[0]`/`[1]` silently reads the wrong column and causes tasks to be
+missed. Always select by column ID — the Step 1c python does this (`cols[id]`
+dict); preserve that pattern in any variant. Never index `column_values` by
+position.
 
 ## Step 3 — Skip what's already in flight
 
@@ -693,9 +700,9 @@ gh pr view "$PR_NUM" --repo "$REPO_SLUG" --json state,mergedAt,headRefName
 **Scope:** only act on tasks whose PR link was set by this loop (i.e. the task was
 in `Ready For Testing` with a non-null `link_mm4bmp5j`). Do not touch tasks that
 reached `Ready For Testing` by other means — if the PR link column is empty, skip
-the item entirely. One GraphQL query fetching `id`, `name`, `color_mm4bfq4e`, and
-`link_mm4bmp5j` for all `Ready For Testing` items is sufficient; skip any with a
-null/empty link value.
+the item entirely. The `TESTING` rows from the Step 1c full-board query already
+carry exactly these fields (each `TESTING` row only exists when the PR link is
+non-empty); consume those rows rather than issuing another board query here.
 
 ---
 
@@ -754,6 +761,11 @@ longer than a single foreground Bash call is allowed to run. Plan for it:
    SRC="<dispatcher repo root from spec>"; WT="$(pwd)"
    cp -al "$SRC/node_modules" "$WT/node_modules" 2>/dev/null || true   # hardlinks, seconds not minutes
    ```
+   Hardlinks only work when `$SRC` and the worktree are on the **same filesystem**
+   (the coderplex worktree under `/home/coder/.coderplex/...` and `~/dev/...`
+   usually are). If `cp -al` fails (cross-device link), it falls through the
+   `|| true` and the background install in step 2 still produces a working tree —
+   just slower. Don't treat a failed hardlink as fatal.
 2. **Install in the background, then poll** — never block a foreground call on it:
    ```bash
    nohup yarn install --prefer-offline --frozen-lockfile > .auto-agent-install.log 2>&1 &
