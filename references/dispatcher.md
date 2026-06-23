@@ -549,7 +549,8 @@ jq -r 'to_entries[] | select(.value.suspended != true) | "\(.key) \(.value.sessi
   [ -f "$WT/.auto-agent-outcome.json" ] && continue
 
   TMUX_NAME="coderplex-$SESSION_ID-claude"
-  PANE=$(tmux capture-pane -t "$TMUX_NAME" -p -S -20 2>/dev/null)
+  # Capture only 5 lines — enough to detect idle/error, minimal token cost
+  PANE=$(tmux capture-pane -t "$TMUX_NAME" -p -S -5 2>/dev/null)
 
   if [ $? -ne 0 ]; then
     echo "DEAD|$TASK_ID|$SESSION_ID"
@@ -565,14 +566,20 @@ jq -r 'to_entries[] | select(.value.suspended != true) | "\(.key) \(.value.sessi
     REASON="idle/crashed"
     [ "$API_ERROR" -gt 0 ] && REASON="API Error (529 or similar)"
     echo "STUCK|$TASK_ID|$SESSION_ID|$REASON"
+  else
+    echo "OK|$TASK_ID|$SESSION_ID"
   fi
 done
 ```
 
+**Never print the tmux pane content** into the turn output — only report the
+verdict (`OK`, `STUCK`, or `DEAD`). The full pane is for debugging only; pasting
+it into every tick wastes tokens on worker progress the user doesn't need here.
+
 **When stuck:**
-1. Check `retriggeredAt` in cp-sessions.json. If it was set in the **current
-   tick's window** (within the last `workerPollIntervalSeconds`), the worker is
-   still stuck after a re-trigger — notify Slack and leave for manual inspection:
+1. Check `retriggeredAt` in cp-sessions.json. If it was set within the last
+   `workerPollIntervalSeconds`, worker is still stuck after re-trigger — notify
+   Slack and leave for manual inspection:
    `⚠️ *<task name>* — worker still stuck after re-trigger, needs manual inspection`
 2. Otherwise, re-trigger once:
    ```bash
