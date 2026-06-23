@@ -9,15 +9,10 @@ every dispatcher turn (it's not huge — ~600 lines; worth the context).
 
 **Channel:** `#alterman-auto-dev`
 
-Resolve and **cache** the channel ID once per session:
+Channel ID is hardcoded — no runtime resolution needed:
 
 ```bash
-SLACK_CHANNEL_ID=$(mcp-s-cli call slack__find-channel-id \
-  '{"channelName":"alterman-auto-dev"}' | jq -r '.channelId // empty')
-# Guard: empty or "channel not found" means channel doesn't exist yet — skip all notifications
-if [ -z "$SLACK_CHANNEL_ID" ] || [ "$SLACK_CHANNEL_ID" = "channel not found" ]; then
-  SLACK_CHANNEL_ID=""
-fi
+SLACK_CHANNEL_ID="C0BCE486ENS"  # #alterman-auto-dev
 ```
 
 **Canonical send pattern** (use everywhere — note `channel_id`, not `channel`):
