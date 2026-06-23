@@ -239,26 +239,25 @@ Then check two compaction triggers:
 
 **When a compaction trigger fires:**
 1. Finish the tick normally (reflect outcomes, pick new work, spawn workers).
-2. At the end of the turn, after `ScheduleWakeup`, output a clearly visible notice:
+2. Call `ScheduleWakeup` as usual so the loop survives compaction.
+3. **Invoke the `/compact` skill directly** using the Skill tool — do not ask the
+   user to run it. Call it as the very last action in the turn:
+   ```
+   Skill({ skill: "compact" })
+   ```
+   This compresses the conversation context automatically. The next wakeup fires
+   into a fresh context and proceeds with re-hydration (see below).
 
-   > **[Auto-Dev] Compaction cycle N reached — please run `/compact` then `start auto-dev polling` to keep context lean.**
-
-3. Do **not** skip the wakeup — the loop continues regardless. The user can compact
-   at their convenience; the notice is advisory, not blocking.
-
-**On the first tick after a compaction** (i.e. the tick that runs after the user
-has compacted and typed `start auto-dev polling`), re-read the full board state
-**before** doing anything else so the fresh context is primed:
-- Query all items with their status, owner, priority, and PR link columns.
-- Summarize the current state in a short bullet list at the top of the turn output:
-  in-flight workers (Dev status + tmux alive), items awaiting PR lifecycle checks
-  (Ready For Testing + PR link), and any Ready For Dev candidates.
+**On the first tick after a compaction** (i.e. the first wakeup after the Skill
+call above, or after the user manually typed `start auto-dev polling` into a fresh
+session), always re-read the full board state before doing anything else:
+- Query all items with status, owner, priority, and PR link columns.
+- Summarize in a short bullet list: in-flight workers (Dev + tmux alive), items
+  in Ready For Testing with a PR link, and Ready For Dev candidates.
 - Then proceed with the normal tick flow.
 
-The dispatcher cannot tell whether the user just compacted, so apply this re-hydration
-whenever it notices its working context feels empty (no remembered board state from
-prior ticks). In practice: if this is the first message of a new conversation, always
-do the full re-read.
+Since the dispatcher can't distinguish "just compacted" from "fresh session", apply
+this re-hydration on every first message of a new conversation unconditionally.
 
 ```bash
 # Read/increment cycle counter — use jq to preserve all other state fields
