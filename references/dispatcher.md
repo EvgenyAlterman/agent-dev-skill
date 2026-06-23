@@ -92,14 +92,18 @@ STATE="$HOME/.auto-agent/dispatcher-state.json"
 INTERVAL=$(jq -r '.pollIntervalSeconds // 300' "$STATE" 2>/dev/null || echo 300)
 ```
 
-### Monday access
+### Monday and Slack access — HARD RULE
 
-Monday is reached via **`mcp-s-cli`** — a shell CLI with its own OAuth token
-(~24h validity). Use it with `Bash` tool calls; **do not** use the
-`mcp__mcp-s__monday__*` MCP tools directly.
+**NEVER use `mcp__mcp-s__*` MCP tools (Monday, Slack, or authenticate).
+Use ONLY `mcp-s-cli` via Bash tool calls — always, no exceptions.**
+
+The `mcp__mcp-s__*` tools use a short-lived in-process token that expires
+frequently and cannot be refreshed without interactive browser flow inside the
+MCP server. `mcp-s-cli` manages its own OAuth token (~24h) independently and is
+the only reliable channel.
 
 ```bash
-# Check auth (exit 0 = ok, exit 4 = needs login) — fast, no network
+# Check auth (exit 0 = ok, exit non-zero = needs login) — fast, no network
 mcp-s-cli check-auth
 
 # Re-login if needed — prints a browser URL; no local callback required
@@ -108,8 +112,7 @@ mcp-s-cli login --remote
 
 If `check-auth` exits non-zero, run `mcp-s-cli login --remote`. Show the printed
 URL to the user as a clickable markdown link and wait for authentication before
-continuing. **Do NOT use `mcp__mcp-s__authenticate`** — that requires the MCP
-server to be running, which may itself be broken when auth has expired.
+continuing.
 
 Confirm tools are on PATH before the first tick:
 ```bash
