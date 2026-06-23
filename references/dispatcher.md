@@ -272,9 +272,9 @@ Include the resolved repo name and GitHub slug in the spec file.
 Fetch the task in full — description, thread, links. Read generously.
 
 ```bash
-# Full task details — note: no body_long (not a valid API field); use body for description
+# Full task details — neither body nor body_long are valid Item fields; description comes from updates/thread only
 mcp-s-cli call monday__all_monday_api \
-  '{"query":"query{items(ids:[ITEM_ID]){name body column_values{id text value}updates(limit:50){id body created_at creator{name}}}}"}'
+  '{"query":"query{items(ids:[ITEM_ID]){name column_values{id text value}updates(limit:50){id body created_at creator{name}}}}"}'
 ```
 
 ### Step 5a — Scan the thread for continuation instructions
