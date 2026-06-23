@@ -432,13 +432,17 @@ For every entry in `cp-sessions.json`, check the outcome file:
 
 - **No outcome file** → worker still running. Leave it.
 - **Outcome `pr_opened`** →
-  1. Set task status to **Ready For Testing**, set PR link column (no comment).
-  2. Suspend: kill the tmux session to free resources, keep worktree alive.
-     ```bash
-     tmux kill-session -t "coderplex-<sessionId>-claude" 2>/dev/null || true
-     ```
-  3. Update cp-sessions.json: add `prUrl`, `suspended: true`, `lastProcessedUpdateId`.
-  4. `_notify "✅ *<task name>* — PR opened: <pr_url>\n<summary>"`
+  1. Post a Monday update comment: `✅ [Auto-PR] PR opened: <pr_url>\n<summary>`.
+     Capture the returned update `id` — this becomes `lastProcessedUpdateId`.
+  2. Set task status to **Ready For Testing**, set PR link column.
+  3. Suspend: do NOT kill the tmux session — leave the worker alive so it can
+     receive follow-up feedback via tmux send-keys without needing a new WebSocket
+     spawn. Mark `"suspended": true` in cp-sessions.json.
+  4. Update cp-sessions.json: add `prUrl`, `suspended: true`,
+     `lastProcessedUpdateId: "<id of the comment just posted>"`.
+     Setting this ID correctly is critical — it anchors the follow-up detection
+     so only comments AFTER the PR-opened comment are treated as new instructions.
+  5. `_notify "✅ *<task name>* — PR opened: <pr_url>\n<summary>"`
 - **Outcome `blocked`** →
   1. Set task status to **Blocked**.
   2. Post **one** `[Auto-Dev]` comment on Monday with the worker's `question`
@@ -476,25 +480,36 @@ are from the dispatcher and are skipped.
 
 **Algorithm:**
 1. Sort updates by `created_at` ascending.
-2. Find the update with `id == lastProcessedUpdateId` — that's the last handled.
-3. Collect all updates after that position where `body` doesn't start with `[Auto-Dev]`.
+2. Find the anchor: the update with `id == lastProcessedUpdateId`.
+   - If `lastProcessedUpdateId` is empty or unset, find the last update whose
+     `body` starts with `[Auto-Dev]` or `✅ [Auto-PR]` — that's the PR-opened
+     comment. Use it as the anchor. If none found, treat ALL updates as new.
+3. Collect all updates **after** the anchor position where `body` does NOT start
+   with `[Auto-Dev]` or `✅ [Auto-PR]`.
 4. Concatenate in order, noting each author.
 
 **When a follow-up is found:**
 
-1. Wake the suspended session via WebSocket + tmux:
+1. Send instructions to the suspended worker via tmux (no WebSocket needed —
+   the session stays alive):
    ```bash
-   FOLLOWUP_PROMPT="You are an auto-agent-dev WORKER continuing work on task $ID. New instructions:\n\n$INSTRUCTIONS\n\nAddress these in the existing branch, push, and write ./.auto-agent-outcome.json when done. Signal the dispatcher via W6b."
-   WS_MOD=$(node -e "try{require.resolve('ws');console.log('ws')}catch(e){console.log(process.env.HOME+'/dev/wixel-agent/node_modules/ws')}" 2>/dev/null || echo "$HOME/dev/wixel-agent/node_modules/ws")
-   node -e "
-   const WebSocket = require('$WS_MOD');
-   const ws = new WebSocket('ws://127.0.0.1:3285/term/$SESSION_ID?mode=claude&cols=220&rows=50');
-   ws.addEventListener('open', () => { setTimeout(() => { ws.close(); process.exit(0); }, 5000); });
-   " 2>/dev/null
-   sleep 3
-   tmux send-keys -t "coderplex-$SESSION_ID-claude" "$FOLLOWUP_PROMPT" Enter
+   FOLLOWUP_PROMPT="New review feedback on PR #<N> — address on the existing branch and push:\n\n$INSTRUCTIONS\n\nWrite ./.auto-agent-outcome.json when done."
+   # First try sending directly; if pane shows a trust/input prompt, send Enter first
+   tmux send-keys -t "coderplex-$SESSION_ID-claude" "Escape" 2>/dev/null
+   sleep 0.5
+   tmux send-keys -t "coderplex-$SESSION_ID-claude" "$FOLLOWUP_PROMPT" 2>/dev/null
+   sleep 0.3
+   tmux send-keys -t "coderplex-$SESSION_ID-claude" "Enter" 2>/dev/null
+   # Check pane shows it was queued, then send Enter again if needed
+   sleep 2
+   tmux capture-pane -t "coderplex-$SESSION_ID-claude" -p 2>/dev/null | grep -q "queued" && \
+     tmux send-keys -t "coderplex-$SESSION_ID-claude" "Enter" 2>/dev/null
    ```
    Mark `"suspended": false` in cp-sessions.json.
+   Delete the old outcome file so the dispatcher sees fresh state:
+   ```bash
+   rm -f "$WORKTREE/.auto-agent-outcome.json"
+   ```
 
 2. `_notify "🔄 *<task name>* — picked up review/follow-up feedback, worker resuming on PR #<N>"`
    (No Monday comment — Slack is the narrative channel.)
