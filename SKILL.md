@@ -138,15 +138,20 @@ token (~24h validity) and requires no MCP server or browser re-auth. Use it
 with `Bash` tool calls; **do not** use the `mcp__mcp-s__monday__*` MCP tools.
 
 ```bash
-# Check auth (exit 0 = ok, exit 4 = needs login)
+# Check auth (exit 0 = ok, exit 4 = needs login) — fast, no network
 mcp-s-cli check-auth
 
-# Re-login if needed (--remote for non-interactive)
+# Re-login if needed — prints a browser URL to stdout, no local callback required
 mcp-s-cli login --remote
 ```
 
-If `check-auth` exits non-zero, run `mcp-s-cli login --remote`, show the
-printed URL to the user, and wait for them to confirm before continuing.
+If `check-auth` exits non-zero, run `mcp-s-cli login --remote`. It prints a
+URL to stdout — show that URL to the user as a clickable markdown link and wait
+for them to authenticate in the browser before continuing.
+
+**Do NOT use `mcp__mcp-s__authenticate`** — that MCP tool requires the mcp-s
+server to be connected, which may itself be broken when auth has expired. The
+`mcp-s-cli` path is always available regardless of MCP server state.
 
 **Common operations:**
 
@@ -200,11 +205,12 @@ prior ticks). In practice: if this is the first message of a new conversation, a
 do the full re-read.
 
 ```bash
-# Read/increment cycle counter
+# Read/increment cycle counter — use jq to preserve all other state fields
 STATE="$HOME/.auto-agent/dispatcher-state.json"
-CYCLE=$(jq -r '.cycle // 0' "$STATE" 2>/dev/null || echo 0)
+[ -f "$STATE" ] || echo '{"cycle":0,"pollIntervalSeconds":600,"workerPollIntervalSeconds":90}' > "$STATE"
+CYCLE=$(jq -r '.cycle // 0' "$STATE")
 CYCLE=$((CYCLE + 1))
-echo "{\"cycle\":$CYCLE}" > "$STATE"
+jq --argjson c "$CYCLE" '.cycle = $c' "$STATE" > /tmp/s.json && mv /tmp/s.json "$STATE"
 ```
 
 ## Step 1c — Housekeeping (mandatory every tick, before picking new work)
