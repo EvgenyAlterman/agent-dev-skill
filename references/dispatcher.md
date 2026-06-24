@@ -249,10 +249,11 @@ lives**, not task name keywords.
 | ---- | -------------------- |
 | `wix-private/wixel-agent` (`~/dev/wixel-agent`) | Agent runtime, session loop, tools, host tools, admin UI, chat UI, codex, simulator, eval, provider adapters, streaming. Also consumer-side code that calls fal/mapping via SDK or RPC. |
 | `wix-private/wixel-ai-tools` (`~/dev/wixel-ai-tools`) | The fal.ai SDK itself, mapping service implementation, mapping admin, AI tools SDK — the provider side. |
+| `wix-private/business-formation-tools` (`~/dev/business-formation-tools`) | Wixel AI assistant chat UI (YOSHI_FLOW_APP), business creation/launcher/term services, brand palette, preset creation, business starter. Multi-package monorepo — any package could be touched. |
 
 **Decision flow:**
 1. Read the task name, description, and thread.
-2. Consumer-side change? → `wixel-agent`. Provider-side? → `wixel-ai-tools`.
+2. Consumer-side wixel agent/admin? → `wixel-agent`. Fal.ai SDK / mapping provider? → `wixel-ai-tools`. AI assistant chat UI, business creation/launcher/branding/wixel embedded experience? → `business-formation-tools`.
 3. If clear, proceed.
 4. **If genuinely ambiguous** — task could belong in either repo and a wrong
    guess would waste the worker run:
@@ -326,11 +327,12 @@ Write `<worktree>/.auto-agent-task.md` **after** the coderplex session reaches
 
 ## Step 6 — Spawn an isolated worker via coderplex
 
-Before spawning any worker, pull the latest master on the two source repos so worktrees branch from up-to-date code:
+Before spawning any worker, pull the latest master on the source repos so worktrees branch from up-to-date code:
 
 ```bash
 git -C ~/dev/wixel-agent pull origin master
 git -C ~/dev/wixel-ai-tools pull origin master
+git -C ~/dev/business-formation-tools pull origin master
 ```
 
 Then proceed to create the session:
@@ -571,11 +573,41 @@ branch, delete the coderplex session, remove from cp-sessions.json.
 
 Check `~/.auto-agent/pending-ga.json` for merged PRs not yet GA'd. For each entry:
 
-**Repo → project mapping (hardcoded defaults):**
+**Repo → project mapping:**
+
+Single-project repos — use directly:
 | Repo | `projectName` | `groupId` | `artifactId` |
 |------|--------------|-----------|--------------|
 | `wixel-agent` | `com.wixpress.wixel.wixel-agent-server` | `com.wixpress.wixel` | `wixel-agent-server` |
 | `wixel-ai-tools` | `com.wixpress.wixel.wixel-ai-models-mapping-service` | `com.wixpress.wixel` | `wixel-ai-models-mapping-service` |
+
+Multi-project repos — try each in order until `where_is_my_commit` returns a hit:
+| Repo | Projects to try (in priority order) |
+|------|-------------------------------------|
+| `business-formation-tools` | `com.wixpress.wixel-ai-assistant`, `com.wixpress.exposure.business-creation-service`, `com.wixpress.brand-palette-service`, `com.wixpress.branding.preset-creation-service`, `com.wixpress.formation-tools.business-term-service` |
+
+For multi-project repos, loop through the project list and call `where_is_my_commit` for each. Use the first one that returns a valid release (non-error). Store all hits (not just the first) in `pending-ga.json` as an array so every affected artifact is tracked.
+
+```bash
+# Example: resolve projects for a business-formation-tools merge commit
+BFT_PROJECTS=(
+  "com.wixpress.wixel-ai-assistant"
+  "com.wixpress.exposure.business-creation-service"
+  "com.wixpress.brand-palette-service"
+  "com.wixpress.branding.preset-creation-service"
+  "com.wixpress.formation-tools.business-term-service"
+)
+FOUND_PROJECTS=()
+for proj in "${BFT_PROJECTS[@]}"; do
+  result=$(mcp-s-cli call devex__where_is_my_commit \
+    "$(jq -n --arg r "$REPO_URL" --arg h "$MERGE_COMMIT" --arg p "$proj" \
+        '{repo_url:$r,commit_hash:$h,project_name:$p}')" 2>/dev/null)
+  echo "$result" | grep -q '"version"' && FOUND_PROJECTS+=("$proj")
+done
+```
+
+The GA notification message should list all found artifacts:
+`🚀 *<task name>* — artifacts GA'd: \`<proj1> @ <v1>\`, \`<proj2> @ <v2>\``
 
 **Step 1 — resolve RC version (if not yet stored):**
 
