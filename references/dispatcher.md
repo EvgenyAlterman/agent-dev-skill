@@ -326,6 +326,15 @@ Write `<worktree>/.auto-agent-task.md` **after** the coderplex session reaches
 
 ## Step 6 — Spawn an isolated worker via coderplex
 
+Before spawning any worker, pull the latest master on the two source repos so worktrees branch from up-to-date code:
+
+```bash
+git -C ~/dev/wixel-agent pull origin master
+git -C ~/dev/wixel-ai-tools pull origin master
+```
+
+Then proceed to create the session:
+
 ```bash
 DAEMON="${CODERPLEX_DAEMON_URL:-http://127.0.0.1:3285}"
 REPO_NAME="wixel-agent"   # or "wixel-ai-tools" per Step 4b
@@ -341,7 +350,7 @@ RESPONSE=$(curl -s -X POST "$DAEMON/api/sessions" \
   -d "$(jq -n \
     --arg repo "$REPO_NAME" \
     --arg branch "$BRANCH" \
-    --arg name "auto-task-$ID" \
+    --arg name "at-$SLUG-$ID" \
     --arg prompt "$WORKER_PROMPT" \
     '{repoName:$repo,branch:$branch,initialMode:"claude",customName:$name,initialPrompt:$prompt}')")
 SESSION_ID=$(echo "$RESPONSE" | jq -r '.id')
@@ -420,8 +429,9 @@ DELAY=$([ "$WORKERS_ALIVE" -gt 0 ] && echo "$WORKER_INTERVAL" || echo "$IDLE_INT
 ```
 
 **Reporting rule — be terse:**
-- Nothing happened this tick → output exactly: `Cycle N — no changes.`
-- Something happened → one line per event only (worker spawned, PR opened, comment picked up, PR merged, error). No bullet lists, no restating what's open, no next-poll countdown.
+- Nothing happened this tick → output exactly: `Cycle N — no changes. Next check at HH:MM (IDT).`
+- Something happened → one line per event only (worker spawned, PR opened, comment picked up, PR merged, error), then `Next check at HH:MM (IDT).` on the same or next line.
+- **Always show the next wakeup as an absolute clock time in Israel time (Asia/Jerusalem / IDT), never as "in N minutes".** Compute it as: current time + delay seconds, formatted as `HH:MM (IDT)`.
 
 Keep idle ticks minimal — one board query, spawn/skip/outcome logic, done.
 
@@ -541,7 +551,8 @@ gh pr view "$PR_NUM" --repo "$REPO_SLUG" --json state,mergedAt,headRefName
   1. Set task status to **Done**.
   2. Delete the remote branch: `git push origin --delete "<headRefName>"`.
   3. `curl -s -X DELETE "$DAEMON/api/sessions/<sessionId>"`, remove from cp-sessions.json.
-  4. `_notify "🎉 *<task name>* — PR merged, task Done"`
+  4. Add to `~/.auto-agent/pending-ga.json` (see GA check section below) with the merge commit and project info — do this BEFORE removing from cp-sessions.json so you still have the repo field.
+  5. `_notify "🎉 *<task name>* — PR merged, task Done"`
 - `CLOSED` (not merged) →
   1. Set task status to **Canceled** (verify label exists first).
   2. Delete remote branch same as merged.
@@ -553,6 +564,89 @@ gh pr view "$PR_NUM" --repo "$REPO_SLUG" --json state,mergedAt,headRefName
 kill the worker tmux, close the open PR (GitHub comment only), delete the remote
 branch, delete the coderplex session, remove from cp-sessions.json.
 `_notify "🚫 *<task name>* — task canceled while worker running; killed worker, closed PR"`
+
+---
+
+## Housekeeping — GA check (each tick)
+
+Check `~/.auto-agent/pending-ga.json` for merged PRs not yet GA'd. For each entry:
+
+**Repo → project mapping (hardcoded defaults):**
+| Repo | `projectName` | `groupId` | `artifactId` |
+|------|--------------|-----------|--------------|
+| `wixel-agent` | `com.wixpress.wixel.wixel-agent-server` | `com.wixpress.wixel` | `wixel-agent-server` |
+| `wixel-ai-tools` | `com.wixpress.wixel.wixel-ai-models-mapping-service` | `com.wixpress.wixel` | `wixel-ai-models-mapping-service` |
+
+**Step 1 — resolve RC version (if not yet stored):**
+
+```bash
+mcp-s-cli call devex__where_is_my_commit \
+  "$(jq -n --arg repo "$REPO_URL" --arg hash "$MERGE_COMMIT" --arg proj "$PROJECT_NAME" \
+      '{repo_url:$repo, commit_hash:$hash, project_name:$proj}')"
+```
+
+Returns `{release: {version: "1.102.0", ...}}` on success, `NOT_FOUND` if the build hasn't been cut yet.
+- On `NOT_FOUND` → skip this tick, check again next tick.
+- On success → store `rcVersion` in pending-ga.json.
+
+**Step 2 — check if RC version is GA'd:**
+
+```bash
+mcp-s-cli call devex__get_rollout_history \
+  "$(jq -n --arg g "$GROUP_ID" --arg a "$ARTIFACT_ID" '{groupId:$g, artifactId:$a, limit:5}')"
+```
+
+**Response parsing note:** `get_rollout_history` wraps its result in `content[0].text` (a JSON string). Parse with:
+```bash
+mcp-s-cli call devex__get_rollout_history ... | python3 -c "
+import sys, json
+outer = json.load(sys.stdin)
+history = json.loads(outer['content'][0]['text'])
+ga = [e for e in history if e.get('type')=='GA' and e.get('status')=='SUCCEEDED']
+print(ga[0]['toVersion'] if ga else 'NONE')
+"
+```
+
+Find the most recent entry where `type == "GA"` and `status == "SUCCEEDED"` and compare `toVersion` vs `rcVersion`:
+- Parse both as `major.minor.patch` integers.
+- If `semver(toVersion) >= semver(rcVersion)` → **GA'd**.
+
+**Version comparison helper (bash):**
+```bash
+semver_gte() {  # returns 0 if $1 >= $2
+  local IFS=.
+  read -r a1 a2 a3 <<< "$1"
+  read -r b1 b2 b3 <<< "$2"
+  [ "$a1" -gt "$b1" ] && return 0
+  [ "$a1" -eq "$b1" ] && [ "$a2" -gt "$b2" ] && return 0
+  [ "$a1" -eq "$b1" ] && [ "$a2" -eq "$b2" ] && [ "${a3:-0}" -ge "${b3:-0}" ] && return 0
+  return 1
+}
+```
+
+**When GA'd:**
+1. Post Monday comment: `[Auto-Dev] 🚀 GA deployed: \`$projectName\` @ \`$rcVersion\``
+2. Slack: `🚀 *<task name>* — artifacts GA'd: \`$projectName @ $rcVersion\``
+3. Remove from pending-ga.json.
+
+**When adding a merged PR to pending-ga.json:**
+```bash
+PENDING_GA="$HOME/.auto-agent/pending-ga.json"
+[ -f "$PENDING_GA" ] || echo '{}' > "$PENDING_GA"
+jq --arg id "$TASK_ID" \
+   --arg name "$TASK_NAME" \
+   --arg pr "$PR_URL" \
+   --arg commit "$MERGE_COMMIT" \
+   --arg repo "$REPO" \
+   --arg repoUrl "$REPO_URL" \
+   --arg proj "$PROJECT_NAME" \
+   --arg g "$GROUP_ID" \
+   --arg a "$ARTIFACT_ID" \
+  '.[$id] = {taskName:$name,prUrl:$pr,mergeCommit:$commit,repo:$repo,repoUrl:$repoUrl,projectName:$proj,groupId:$g,artifactId:$a,rcVersion:null}' \
+  "$PENDING_GA" > /tmp/ga-tmp.json && mv /tmp/ga-tmp.json "$PENDING_GA"
+```
+
+**Note:** `rcVersion` starts as `null` until resolved by `where_is_my_commit`. Always check in the GA step and populate it if it's still null.
 
 ---
 
