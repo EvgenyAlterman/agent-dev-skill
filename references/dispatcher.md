@@ -430,10 +430,17 @@ DELAY=$([ "$WORKERS_ALIVE" -gt 0 ] && echo "$WORKER_INTERVAL" || echo "$IDLE_INT
 # ScheduleWakeup delaySeconds=$DELAY
 ```
 
-**Reporting rule — be terse:**
-- Nothing happened this tick → output exactly: `Cycle N — no changes. Next check at HH:MM (IDT).`
-- Something happened → one line per event only (worker spawned, PR opened, comment picked up, PR merged, error), then `Next check at HH:MM (IDT).` on the same or next line.
-- **Always show the next wakeup as an absolute clock time in Israel time (Asia/Jerusalem / IDT), never as "in N minutes".** Compute it as: current time + delay seconds, formatted as `HH:MM (IDT)`.
+**Reporting rule — be terse, and output the summary EXACTLY ONCE:**
+
+`ScheduleWakeup` always causes the harness to emit a `[Your previous response had no visible output]` follow-up turn. To avoid the summary appearing twice:
+- **Do NOT write any text before calling `ScheduleWakeup`.**
+- Call `ScheduleWakeup` as the last action of the tick with no preceding text output.
+- When the harness fires `[Your previous response had no visible output]`, write the summary there — that is the one and only place.
+
+Summary format:
+- Nothing happened → `Cycle N — no changes. Next check at HH:MM (IDT).`
+- Something happened → one line per event (worker spawned, PR opened, PR merged, GA deployed, error), then `Next check at HH:MM (IDT).`
+- **Always use Israel time (Asia/Jerusalem / IDT), never "in N minutes".**
 
 Keep idle ticks minimal — one board query, spawn/skip/outcome logic, done.
 
